@@ -1,5 +1,6 @@
 import logging.config
 import os
+import time
 from collections import OrderedDict
 from random import randint, uniform, gauss
 from time import sleep, monotonic
@@ -10,6 +11,7 @@ from PIL import Image
 # from config import *
 import config
 import imgreco
+import imgreco.imgops
 import penguin_stats.loader
 import penguin_stats.reporter
 import richlog
@@ -58,8 +60,9 @@ def _penguin_report(recoresult):
         return
     logger.info('向企鹅数据汇报掉落...')
     reportid = penguin_stats.reporter.report(recoresult)
-    if reportid is not None:
+    if bool(reportid):
         logger.info('企鹅数据报告 ID: %s', reportid)
+    return reportid
 
 
 class ArknightsHelper(object):
@@ -99,8 +102,7 @@ class ArknightsHelper(object):
         logger.info('ADB 服务器:\t%s:%d', *config.ADB_SERVER)
         logger.info('分辨率:\t%dx%d', *self.viewport)
         logger.info('OCR 引擎:\t%s', ocr.engine.info)
-        logger.info('截图路径 (legacy):\t%s', config.SCREEN_SHOOT_SAVE_PATH)
-        logger.info('存储路径 (legacy):\t%s', config.STORAGE_PATH)
+        logger.info('截图路径:\t%s', config.SCREEN_SHOOT_SAVE_PATH)
 
         if config.enable_baidu_api:
             logger.info('%s',
@@ -174,6 +176,20 @@ class ArknightsHelper(object):
         finalpt = m + halfvec * bddiff
         self.adb.touch_tap(tuple(int(x) for x in finalpt))
         self.__wait(TINY_WAIT, MANLIKE_FLAG=True)
+
+    def wait_for_still_image(self, screen_range=None):
+        screenshot = self.adb.get_screen_shoot(screen_range)
+        for n in range(60):
+            self.__wait(1)
+            screenshot2 = self.adb.get_screen_shoot(screen_range)
+            mse = imgreco.imgops.compare_mse(screenshot, screenshot2)
+            if mse <= 1:
+                return screenshot
+            screenshot = screenshot2
+            n += 1
+            if n == 9:
+                logger.info("等待画面静止")
+        raise RuntimeError("60秒内画面未静止")
 
     def module_login(self):
         logger.debug("base.module_login")
@@ -251,7 +267,9 @@ class ArknightsHelper(object):
 
     def operation_once_statemachine(self, c_id):
         smobj = ArknightsHelper.operation_once_state()
-
+        refill_with_item = config.get('behavior/refill_ap_with_item', False)
+        refill_with_originium = config.get('behavior/refill_ap_with_oiriginium', False)
+        use_refill = refill_with_item or refill_with_originium
         def on_prepare(smobj):
             count_times = 0
             while True:
@@ -285,9 +303,30 @@ class ArknightsHelper(object):
                     break
 
             self.CURRENT_STRENGTH = int(recoresult['AP'].split('/')[0])
-            logger.info('当前理智 %d, 关卡消耗 %d', self.CURRENT_STRENGTH, recoresult['consume'])
+            ap_text = '理智' if recoresult['consume_ap'] else '门票'
+            logger.info('当前%s %d, 关卡消耗 %d', ap_text, self.CURRENT_STRENGTH, recoresult['consume'])
             if self.CURRENT_STRENGTH < int(recoresult['consume']):
-                logger.error('理智不足')
+                logger.error(ap_text + '不足')
+                if use_refill:
+                    logger.info('尝试回复理智')
+                    self.tap_rect(imgreco.before_operation.get_start_operation_rect(self.viewport))
+                    self.__wait(SMALL_WAIT)
+                    screenshot = self.adb.get_screen_shoot()
+                    refill_type = imgreco.before_operation.check_ap_refill_type(screenshot)
+                    confirm_refill = False
+                    if refill_type == 'item' and refill_with_item:
+                        logger.info('使用道具回复理智')
+                        confirm_refill = True
+                    if refill_type == 'originium' and refill_with_originium:
+                        logger.info('碎石回复理智')
+                        confirm_refill = True
+                    # FIXME: 1. 道具回复量不足时也会尝试使用
+                    # FIXME: 2. 缺少没有道具和源石时的情况
+                    if confirm_refill:
+                        self.tap_rect(imgreco.before_operation.get_ap_refill_confirm_rect(self.viewport))
+                        self.__wait(MEDIUM_WAIT)
+                        return  # to on_prepare state
+                    logger.error('未能回复理智')
                 raise StopIteration()
 
             if not recoresult['delegated']:
@@ -341,7 +380,7 @@ class ArknightsHelper(object):
             if imgreco.end_operation.check_end_operation(screenshot):
                 logger.info('战斗结束')
                 self.operation_time.append(t)
-                self.__wait(SMALL_WAIT)
+                self.wait_for_still_image()
                 smobj.state = on_end_operation
                 return
             logger.info('战斗未结束')
@@ -351,20 +390,26 @@ class ArknightsHelper(object):
             self.__wait(SMALL_WAIT, MANLIKE_FLAG=True)
             logger.info('关闭升级提示')
             self.tap_rect(imgreco.end_operation.get_dismiss_level_up_popup_rect(self.viewport))
-            self.__wait(SMALL_WAIT, MANLIKE_FLAG=True)
+            self.wait_for_still_image()
             smobj.state = on_end_operation
 
         def on_end_operation(smobj):
             screenshot = self.adb.get_screen_shoot()
             logger.info('离开结算画面')
             self.tap_rect(imgreco.end_operation.get_dismiss_end_operation_rect(self.viewport))
+            reportid = None
             try:
                 # 掉落识别
                 drops = imgreco.end_operation.recognize(screenshot)
                 logger.info('掉落识别结果：%s', repr(drops))
-                _penguin_report(drops)
+                reportid = _penguin_report(drops)
             except Exception as e:
                 logger.error('', exc_info=True)
+            if reportid is None:
+                filename = os.path.join(config.SCREEN_SHOOT_SAVE_PATH, '未上报掉落-%d.png' % time.time())
+                with open(filename, 'wb') as f:
+                    screenshot.save(f, format='PNG')
+                logger.error('截图已保存到 %s', filename)
             smobj.stop = True
 
         smobj.state = on_prepare
